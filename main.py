@@ -29,6 +29,14 @@ except Exception:
 # ─────────────────────────────────────────────────────────────
 
 load_dotenv()
+print("=" * 60)
+print("Loading Environment Variables")
+print("GEMINI_API_KEY:", bool(os.getenv("GEMINI_API_KEY")))
+print("HF_API_KEY:", bool(os.getenv("HF_API_KEY")))
+print("VIRUSTOTAL_API_KEY:", bool(os.getenv("VIRUSTOTAL_API_KEY")))
+print("SUPABASE_URL:", bool(os.getenv("SUPABASE_URL")))
+print("SUPABASE_SERVICE_KEY:", bool(os.getenv("SUPABASE_SERVICE_KEY")))
+print("=" * 60)
 
 # ─────────────────────────────────────────────────────────────
 # App Setup
@@ -78,6 +86,7 @@ HF_API_KEY = os.getenv("HF_API_KEY", "")
 VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_SERVICE_KEY = os.getenv("SUPABASE_SERVICE_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 HF_MODEL_URL = "https://router.huggingface.co/hf-inference/models/ealvaradob/bert-finetuned-phishing"
 
@@ -240,38 +249,83 @@ async def hf_classify(text: str) -> tuple[str, float]:
 # ─────────────────────────────────────────────────────────────
 # Gemini Explanation
 # ─────────────────────────────────────────────────────────────
-
-async def gemini_explain(input_text: str, label: str, flags: list[str]) -> str:
-    """Generate explanation using Gemini API"""
-    if not GEMINI_API_KEY or google_genai is None:
+def _fallback_explanation(label: str, flags: list[str]) -> str:
+    if label == "PHISHING":
+        if flags:
+            return (
+                f"This content appears to be phishing because it contains "
+                f"{', '.join(flags)}. Exercise caution before interacting with it."
+            )
         return (
-            f"This content is classified as {label}. "
-            f"Detected issues: {', '.join(flags[:3]) if flags else 'None'}."
+            "This content appears suspicious based on the security analysis."
         )
+
+    return (
+        "No major phishing indicators were detected. "
+        "However, always verify the source before trusting any links or attachments."
+    )
+
+async def gemini_explain(input_text: str, label: str, flags: list[str]):
+
+    if not GEMINI_API_KEY:
+        print("Gemini API key missing")
+        return _fallback_explanation(label, flags)
+
+    if google_genai is None:
+        print("google-genai package not installed")
+        return _fallback_explanation(label, flags)
+
+    flag_text = (
+    "\n".join(f"- {flag}" for flag in flags)
+    if flags
+    else "- None"
+)
+
+    prompt = f"""
+You are a cybersecurity analyst.
+
+Verdict: {label}
+
+Input:
+{input_text}
+
+Detected indicators:
+{flag_text}
+
+Explain in exactly two short sentences why this content was classified this way.
+Use simple English.
+"""
 
     try:
-        client = google_genai.Client(api_key=GEMINI_API_KEY)
-        prompt = f"""Explain why this content is {label}.
 
-Input: {input_text[:200]}
-
-Flags: {', '.join(flags)}
-
-Use simple language in 2-3 sentences."""
+        client = google_genai.Client(
+            api_key=GEMINI_API_KEY
+        )
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model=GEMINI_MODEL,
             contents=prompt,
         )
-        return response.text.strip()
+
+        if (
+            response
+            and hasattr(response, "text")
+            and response.text
+        ):
+            print("Gemini Success")
+            return response.text.strip()
+
+        print("Gemini returned empty response")
 
     except Exception as e:
-        print(f"Gemini error: {str(e)}")
-        return (
-            f"This content is classified as {label}. "
-            f"Detected issues: {', '.join(flags[:3]) if flags else 'None'}."
-        )
 
+        print("=" * 60)
+        print("GEMINI ERROR")
+        print(type(e).__name__)
+        print(e)
+        print("=" * 60)
+
+    return _fallback_explanation(label, flags)
 # ─────────────────────────────────────────────────────────────
 # VirusTotal Check
 # ─────────────────────────────────────────────────────────────
@@ -375,6 +429,38 @@ async def debug():
         "huggingface": bool(HF_API_KEY),
         "virustotal": bool(VIRUSTOTAL_API_KEY),
     }
+@app.get("/test-gemini")
+async def test_gemini():
+
+    if not GEMINI_API_KEY:
+        return {
+            "success": False,
+            "error": "Gemini API key missing"
+        }
+
+    try:
+
+        client = google_genai.Client(
+            api_key=GEMINI_API_KEY
+        )
+
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents="Reply only with: Gemini is working."
+        )
+
+        return {
+            "success": True,
+            "response": response.text
+        }
+
+    except Exception as e:
+
+        return {
+            "success": False,
+            "error": str(e),
+            "type": type(e).__name__
+        }
 
 # ─────────────────────────────────────────────────────────────
 # Routes - Analysis
@@ -404,7 +490,7 @@ async def analyze_url(request: Request, body: URLRequest):
 
     result = AnalysisResult(
         label=label,
-        confidence=round(conf, 3),
+        confidence=min(0.99, round(conf, 3)),
         red_flags=flags,
         explanation=explanation,
         virustotal_detections=vt,
@@ -438,7 +524,7 @@ async def analyze_email(request: Request, body: EmailRequest):
 
     result = AnalysisResult(
         label=label,
-        confidence=round(conf, 3),
+        confidence=min(0.99, round(conf, 3)),
         red_flags=flags,
         explanation=explanation,
     )
@@ -528,12 +614,12 @@ async def get_dashboard(user_id: str):
 
 @app.on_event("startup")
 async def startup_event():
-    print("\n" + "="*50)
-    print("PhishGuard API v3.0 Starting")
-    print("="*50)
-    print(f"✓ Database: {bool(supabase)}")
-    print(f"✓ Gemini: {bool(GEMINI_API_KEY)}")
-    print(f"✓ HuggingFace: {bool(HF_API_KEY)}")
-    print(f"✓ VirusTotal: {bool(VIRUSTOTAL_API_KEY)}")
-    print(f"✓ Allowed Origins: {len(ALLOWED_ORIGINS)} configured")
-    print("="*50 + "\n")
+    print("\n" + "=" * 60)
+    print("PhishGuard API Started")
+    print("=" * 60)
+    print(f"Supabase Connected : {supabase is not None}")
+    print(f"Gemini Key Present : {bool(GEMINI_API_KEY)}")
+    print(f"HuggingFace Key : {bool(HF_API_KEY)}")
+    print(f"VirusTotal Key : {bool(VIRUSTOTAL_API_KEY)}")
+    print(f"Allowed Origins : {ALLOWED_ORIGINS}")
+    print("=" * 60 + "\n")
